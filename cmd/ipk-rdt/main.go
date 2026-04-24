@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 
+	"ipk-rdt/internal/app"
 	"ipk-rdt/internal/config"
 )
 
@@ -15,10 +16,41 @@ func main() {
 	}
 
 	if cfg.IsServer {
-		fmt.Fprintf(os.Stderr, "Server mode running on port %d...\n", cfg.Port)
-		// TODO: initialize and start server
+		var out *os.File
+		if cfg.Output == "-" {
+			out = os.Stdout
+		} else {
+			out, err = os.Create(cfg.Output)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error creating output file: %v\n", err)
+				os.Exit(1)
+			}
+			defer out.Close()
+		}
+
+		err = app.RunServer(cfg, out)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
+			os.Exit(1)
+		}
+
 	} else if cfg.IsClient {
-		fmt.Fprintf(os.Stderr, "Client mode connecting to %s:%d...\n", cfg.Address, cfg.Port)
-		// TODO: initialize and start client
+		var in *os.File
+		if cfg.Input == "-" {
+			in = os.Stdin
+		} else {
+			in, err = os.Open(cfg.Input)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error opening input file: %v\n", err)
+				os.Exit(1)
+			}
+			defer in.Close()
+		}
+
+		err = app.RunClient(cfg, in)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Client error: %v\n", err)
+			os.Exit(1)
+		}
 	}
 }

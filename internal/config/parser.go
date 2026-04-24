@@ -4,6 +4,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 )
 
@@ -23,7 +24,7 @@ func ParseArgs(args []string) (*Config, error) {
 	fs := flag.NewFlagSet("ipk-rdt", flag.ContinueOnError)
 
 	// Keep outputs silent to easily intercept ErrHelp and usage
-	fs.SetOutput(os.Stderr)
+	fs.SetOutput(io.Discard)
 
 	cfg := &Config{}
 	
@@ -34,12 +35,6 @@ func ParseArgs(args []string) (*Config, error) {
 	fs.StringVar(&cfg.Input, "i", "-", "Input file (client only)")
 	fs.StringVar(&cfg.Output, "o", "-", "Output file (server only)")
 	fs.IntVar(&cfg.Timeout, "w", 1, "Timeout in seconds")
-
-	customUsage := func() {
-		fmt.Fprintf(os.Stderr, "Usage of ipk-rdt:\n")
-		fs.PrintDefaults()
-	}
-	fs.Usage = customUsage
 
 	err := fs.Parse(args)
 	if err != nil {
