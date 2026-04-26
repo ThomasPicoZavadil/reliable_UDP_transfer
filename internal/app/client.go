@@ -4,11 +4,13 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 
 	"ipk-rdt/internal/config"
+	"ipk-rdt/internal/protocol"
 )
 
-// RunClient reads from the input stream and sends data sequentially over UDP.
+// RunClient reads from the input stream and sends data sequentially over UDP
 func RunClient(cfg *config.Config, in io.Reader) error {
 	addr := fmt.Sprintf("%s:%d", cfg.Address, cfg.Port)
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
@@ -22,16 +24,40 @@ func RunClient(cfg *config.Config, in io.Reader) error {
 	}
 	defer conn.Close()
 
-	// Assign max payload limit
-	buf := make([]byte, 1200)
+	// Assign max payload limit based on full minus header bytes
+	buf := make([]byte, 1200-protocol.HeaderSize)
+
+	var seqNum uint32 = 0
 
 	for {
 		n, readErr := in.Read(buf)
 		if n > 0 {
-			_, writeErr := conn.Write(buf[:n])
+			payload := buf[:n]
+
+			h := protocol.Header{
+				ConnectionID: 1,
+				SeqNum:       seqNum,
+				AckNum:       0,
+				Flags:        0,
+				Padding:      0,
+				Length:       uint16(n),
+				Checksum:     0,
+			}
+			
+			headerBytes := h.Encode()
+			h.Checksum = protocol.CalculateChecksum(headerBytes, payload)
+			headerBytes = h.Encode()
+
+			fmt.Fprintf(os.Stderr, "Client sent packet - ConnID: %d, Seq: %d, Ack: %d, Len: %d, Checksum: %x\n", 
+				h.ConnectionID, h.SeqNum, h.AckNum, h.Length, h.Checksum)
+
+			combined := append(headerBytes, payload...)
+
+			_, writeErr := conn.Write(combined)
 			if writeErr != nil {
 				return fmt.Errorf("failed to send data: %w", writeErr)
 			}
+			seqNum += uint32(n)
 		}
 
 		if readErr != nil {
