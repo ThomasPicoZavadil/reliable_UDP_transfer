@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
 
 	"ipk-rdt/internal/config"
 	"ipk-rdt/internal/protocol"
@@ -12,7 +13,7 @@ import (
 
 // RunClient reads from the input stream and sends data sequentially over UDP
 func RunClient(cfg *config.Config, in io.Reader) error {
-	addr := fmt.Sprintf("%s:%d", cfg.Address, cfg.Port)
+	addr := net.JoinHostPort(cfg.Address, strconv.Itoa(cfg.Port))
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return fmt.Errorf("failed to resolve address: %w", err)

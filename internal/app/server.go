@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
 
 	"ipk-rdt/internal/config"
 	"ipk-rdt/internal/protocol"
@@ -12,10 +13,7 @@ import (
 
 // RunServer binds to a UDP socket, reads incoming datagrams sequentially, and writes to an output stream
 func RunServer(cfg *config.Config, out io.Writer) error {
-	addr := fmt.Sprintf("%s:%d", cfg.Address, cfg.Port)
-	if cfg.Address == "" {
-		addr = fmt.Sprintf(":%d", cfg.Port)
-	}
+	addr := net.JoinHostPort(cfg.Address, strconv.Itoa(cfg.Port))
 
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
