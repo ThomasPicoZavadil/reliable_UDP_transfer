@@ -7,11 +7,180 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"ipk-rdt/internal/config"
 	"ipk-rdt/internal/protocol"
 )
+
+type Packet struct {
+	SeqNum uint32
+	Data   []byte
+	Timer  *time.Timer
+}
+
+type Sender struct {
+	WindowSize uint32
+	SendBase   uint32
+	NextSeqNum uint32
+
+	Buffer map[uint32]*Packet
+
+	mu         sync.Mutex
+	windowCond *sync.Cond
+
+	conn   *net.UDPConn
+	connID uint32
+
+	timeout time.Duration // e.g. 500ms for fast internal retransmissions
+}
+
+func NewSender(conn *net.UDPConn, connID uint32, windowSizePackets uint32, timeoutSec int) *Sender {
+	s := &Sender{
+		WindowSize: windowSizePackets,
+		SendBase:   0,
+		NextSeqNum: 0,
+		Buffer:     make(map[uint32]*Packet),
+		conn:       conn,
+		connID:     connID,
+		timeout:    time.Duration(timeoutSec) * time.Second,
+	}
+	s.windowCond = sync.NewCond(&s.mu)
+	return s
+}
+
+func (s *Sender) Start(in io.Reader) error {
+	go s.receiveACKs()
+
+	maxPayload := uint32(1200 - protocol.HeaderSize)
+	buf := make([]byte, maxPayload)
+
+	for {
+		n, readErr := in.Read(buf)
+		if n > 0 {
+			payload := make([]byte, n)
+			copy(payload, buf[:n])
+
+			s.mu.Lock()
+			// Block if the window is full
+			for (s.NextSeqNum-s.SendBase)/maxPayload >= s.WindowSize {
+				s.windowCond.Wait()
+			}
+
+			// Capture sequence number before creating header
+			seqNum := s.NextSeqNum
+			s.NextSeqNum += uint32(n)
+
+			h := protocol.Header{
+				ConnectionID: s.connID,
+				SeqNum:       seqNum,
+				AckNum:       0,
+				Flags:        0,
+				Padding:      0,
+				Length:       uint16(n),
+				Checksum:     0,
+			}
+
+			headerBytes := h.Encode()
+			h.Checksum = protocol.CalculateChecksum(headerBytes, payload)
+			headerBytes = h.Encode()
+
+			combined := append(headerBytes, payload...)
+
+			p := &Packet{
+				SeqNum: seqNum,
+				Data:   combined,
+			}
+			
+			// Setup timer
+			p.Timer = time.AfterFunc(s.timeout, func() {
+				s.mu.Lock()
+				// Verify if packet is still in buffer before resending
+				if _, ok := s.Buffer[seqNum]; ok {
+                    fmt.Fprintf(os.Stderr, "Client timeout retransmitting - Seq: %d\n", seqNum)
+					s.conn.Write(p.Data)
+					p.Timer.Reset(s.timeout) // Restart timer
+				}
+				s.mu.Unlock()
+			})
+
+			s.Buffer[seqNum] = p
+			s.mu.Unlock()
+
+			// Initial send
+            fmt.Fprintf(os.Stderr, "Client sent packet - Seq: %d, Len: %d\n", h.SeqNum, h.Length)
+			_, writeErr := s.conn.Write(p.Data)
+			if writeErr != nil {
+				return fmt.Errorf("failed to send data: %w", writeErr)
+			}
+		}
+
+		if readErr != nil {
+			if readErr == io.EOF {
+				break
+			}
+			return fmt.Errorf("error reading input stream: %w", readErr)
+		}
+	}
+
+	// Wait for all outstanding packets to be ACKed
+	s.mu.Lock()
+	for len(s.Buffer) > 0 {
+		s.windowCond.Wait()
+	}
+	s.mu.Unlock()
+
+	return nil
+}
+
+func (s *Sender) receiveACKs() {
+	buf := make([]byte, 1200)
+	for {
+		s.conn.SetReadDeadline(time.Time{})
+		n, _, err := s.conn.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+
+		if n < protocol.HeaderSize {
+			continue
+		}
+
+		hBytes := buf[:protocol.HeaderSize]
+		var ackHeader protocol.Header
+		if err := ackHeader.Decode(hBytes); err != nil {
+			continue
+		}
+
+		crc := protocol.CalculateChecksum(hBytes, buf[protocol.HeaderSize:n])
+		if crc != ackHeader.Checksum {
+			continue
+		}
+
+		if ackHeader.ConnectionID != s.connID {
+			continue
+		}
+
+		if (ackHeader.Flags & protocol.FlagACK) == protocol.FlagACK {
+			s.mu.Lock()
+			ackNum := ackHeader.AckNum
+			
+			if ackNum > s.SendBase {
+                for seq, pkt := range s.Buffer {
+                    if seq < ackNum {
+                        pkt.Timer.Stop()
+                        delete(s.Buffer, seq)
+                    }
+                }
+                
+                s.SendBase = ackNum
+				s.windowCond.Broadcast() // Wake up the sender
+			}
+			s.mu.Unlock()
+		}
+	}
+}
 
 // clientHandshake handles the SYN-ACK handshake sequence with the server
 func clientHandshake(conn *net.UDPConn, connID uint32, timeoutSec int) error {
@@ -125,48 +294,10 @@ func RunClient(cfg *config.Config, in io.Reader) error {
 		return err
 	}
 
-	// Assign max payload limit based on full minus header bytes
-	buf := make([]byte, 1200-protocol.HeaderSize)
-
-	var seqNum uint32 = 0
-
-	for {
-		n, readErr := in.Read(buf)
-		if n > 0 {
-			payload := buf[:n]
-
-			h := protocol.Header{
-				ConnectionID: connID,
-				SeqNum:       seqNum,
-				AckNum:       0,
-				Flags:        0,
-				Padding:      0,
-				Length:       uint16(n),
-				Checksum:     0,
-			}
-			
-			headerBytes := h.Encode()
-			h.Checksum = protocol.CalculateChecksum(headerBytes, payload)
-			headerBytes = h.Encode()
-
-			fmt.Fprintf(os.Stderr, "Client sent packet - ConnID: %d, Seq: %d, Ack: %d, Len: %d, Checksum: %x\n", 
-				h.ConnectionID, h.SeqNum, h.AckNum, h.Length, h.Checksum)
-
-			combined := append(headerBytes, payload...)
-
-			_, writeErr := conn.Write(combined)
-			if writeErr != nil {
-				return fmt.Errorf("failed to send data: %w", writeErr)
-			}
-			seqNum += uint32(n)
-		}
-
-		if readErr != nil {
-			if readErr == io.EOF {
-				break
-			}
-			return fmt.Errorf("error reading input stream: %w", readErr)
-		}
+	sender := NewSender(conn, connID, 5, cfg.Timeout) // Set bound configuration natively.
+	err = sender.Start(in)
+	if err != nil {
+		return err
 	}
 
 	return nil
