@@ -157,11 +157,29 @@ func RunServer(cfg *config.Config, out io.Writer) error {
 		return err
 	}
 
+	var expectedSeqNum uint32 = 0
+
 	if initPayload != nil && len(initPayload) > 0 {
 		_, writeErr := out.Write(initPayload)
 		if writeErr != nil {
 			return fmt.Errorf("failed to write early output stream: %w", writeErr)
 		}
+		expectedSeqNum += uint32(len(initPayload))
+
+		// Dispatch formal explicit ACK for implicitly bypassed traffic
+		ackHeader := protocol.Header{
+			ConnectionID: targetConnID,
+			SeqNum:       0,
+			AckNum:       expectedSeqNum,
+			Flags:        protocol.FlagACK,
+			Padding:      0,
+			Length:       0,
+			Checksum:     0,
+		}
+		aBytes := ackHeader.Encode()
+		ackHeader.Checksum = protocol.CalculateChecksum(aBytes, nil)
+		aBytes = ackHeader.Encode()
+		conn.WriteToUDP(aBytes, clientAddr)
 	}
 
 	buf := make([]byte, 1200)
@@ -204,12 +222,35 @@ func RunServer(cfg *config.Config, out io.Writer) error {
 				continue // Drop foreign payloads natively
 			}
 
-			fmt.Fprintf(os.Stderr, "Server received packet - ConnID: %d, Seq: %d, Ack: %d, Len: %d, Checksum: %x\n", 
-				h.ConnectionID, h.SeqNum, h.AckNum, h.Length, h.Checksum)
+			// Core sequential filtering
+			if h.SeqNum == expectedSeqNum {
+				fmt.Fprintf(os.Stderr, "Server received in-order packet - Seq: %d, Len: %d\n", h.SeqNum, h.Length)
+				_, writeErr := out.Write(payload)
+				if writeErr != nil {
+					return fmt.Errorf("failed to write output stream: %w", writeErr)
+				}
+				expectedSeqNum += uint32(h.Length)
+			} else {
+				fmt.Fprintf(os.Stderr, "Server received out-of-order packet - Seq: %d (expected %d). Dropping.\n", h.SeqNum, expectedSeqNum)
+			}
 
-			_, writeErr := out.Write(payload)
-			if writeErr != nil {
-				return fmt.Errorf("failed to write output stream: %w", writeErr)
+			// Cumulatively generate returning dynamic ACKs structurally mapped tracking latest guaranteed bounds
+			ackHeader := protocol.Header{
+				ConnectionID: targetConnID,
+				SeqNum:       0,
+				AckNum:       expectedSeqNum,
+				Flags:        protocol.FlagACK,
+				Padding:      0,
+				Length:       0,
+				Checksum:     0,
+			}
+			aBytes := ackHeader.Encode()
+			ackHeader.Checksum = protocol.CalculateChecksum(aBytes, nil)
+			aBytes = ackHeader.Encode()
+
+			_, sendErr := conn.WriteToUDP(aBytes, clientAddr)
+			if sendErr != nil {
+				fmt.Fprintf(os.Stderr, "Server failed sending local ACK natively: %v\n", sendErr)
 			}
 		}
 
