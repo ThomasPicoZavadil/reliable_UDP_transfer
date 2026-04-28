@@ -33,7 +33,8 @@ type Sender struct {
 	conn   *net.UDPConn
 	connID uint32
 
-	timeout time.Duration // e.g. 500ms for fast internal retransmissions
+	timeout time.Duration
+	done    chan struct{}
 }
 
 func NewSender(conn *net.UDPConn, connID uint32, windowSizePackets uint32, timeoutSec int) *Sender {
@@ -45,9 +46,14 @@ func NewSender(conn *net.UDPConn, connID uint32, windowSizePackets uint32, timeo
 		conn:       conn,
 		connID:     connID,
 		timeout:    time.Duration(timeoutSec) * time.Second,
+		done:       make(chan struct{}),
 	}
 	s.windowCond = sync.NewCond(&s.mu)
 	return s
+}
+
+func (s *Sender) Stop() {
+	close(s.done)
 }
 
 func (s *Sender) Start(in io.Reader) error {
@@ -137,9 +143,18 @@ func (s *Sender) Start(in io.Reader) error {
 func (s *Sender) receiveACKs() {
 	buf := make([]byte, 1200)
 	for {
-		s.conn.SetReadDeadline(time.Time{})
+		select {
+		case <-s.done:
+			return
+		default:
+		}
+
+		s.conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
 		n, _, err := s.conn.ReadFromUDP(buf)
 		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
 			return
 		}
 
@@ -180,6 +195,122 @@ func (s *Sender) receiveACKs() {
 			s.mu.Unlock()
 		}
 	}
+}
+
+// clientTeardown maps FIN bounds generating native TIME_WAIT isolation mappings
+func clientTeardown(conn *net.UDPConn, connID uint32, finSeqNum uint32, timeoutSec int) error {
+	deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
+	buf := make([]byte, 1200)
+
+	// Phase 1: Generate explicit FIN, bound loops natively triggering timeouts mapped globally
+	for {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("teardown timeout: failed to complete FIN_WAIT cleanly within %d seconds", timeoutSec)
+		}
+
+		finHeader := protocol.Header{
+			ConnectionID: connID,
+			SeqNum:       finSeqNum,
+			AckNum:       0,
+			Flags:        protocol.FlagFIN,
+			Padding:      0,
+			Length:       0,
+			Checksum:     0,
+		}
+		fBytes := finHeader.Encode()
+		finHeader.Checksum = protocol.CalculateChecksum(fBytes, nil)
+		fBytes = finHeader.Encode()
+
+		_, err := conn.Write(fBytes)
+		if err != nil {
+			return fmt.Errorf("failed to send explicit FIN: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "Client sent explicit FIN - ConnID: %d\n", connID)
+
+		conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		n, _, err := conn.ReadFromUDP(buf)
+
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				// Retry connection FIN drops
+				continue
+			}
+			return fmt.Errorf("failed reading dynamic frames during teardown FIN_WAIT: %w", err)
+		}
+
+		if n < protocol.HeaderSize {
+			continue // Drop explicit structural fails natively
+		}
+
+		var recvHeader protocol.Header
+		hBytesRecv := buf[:protocol.HeaderSize]
+		if err := recvHeader.Decode(hBytesRecv); err != nil {
+			continue
+		}
+
+		crc := protocol.CalculateChecksum(hBytesRecv, buf[protocol.HeaderSize:n])
+		if crc != recvHeader.Checksum {
+			continue
+		}
+
+		if recvHeader.ConnectionID != connID {
+			continue
+		}
+
+		if (recvHeader.Flags & (protocol.FlagFIN | protocol.FlagACK)) == (protocol.FlagFIN | protocol.FlagACK) {
+			fmt.Fprintf(os.Stderr, "Client received structural FIN-ACK - ConnID: %d\n", recvHeader.ConnectionID)
+			break // Break exactly into TIME_WAIT bounds logically natively
+		}
+	}
+
+	// Phase 2: Form final cumulative explicit ACK natively executing structurally silent timeouts 
+	timeWaitDeadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
+
+	ackHeader := protocol.Header{
+		ConnectionID: connID,
+		SeqNum:       0,
+		AckNum:       0,
+		Flags:        protocol.FlagACK,
+		Padding:      0,
+		Length:       0,
+		Checksum:     0,
+	}
+	aBytes := ackHeader.Encode()
+	ackHeader.Checksum = protocol.CalculateChecksum(aBytes, nil)
+	aBytes = ackHeader.Encode()
+
+	conn.Write(aBytes)
+	fmt.Fprintf(os.Stderr, "Client sent final cumulative ACK - ConnID: %d. Entering silent TIME_WAIT for %ds\n", connID, timeoutSec)
+
+	for {
+		if time.Now().After(timeWaitDeadline) {
+			break
+		}
+
+		conn.SetReadDeadline(timeWaitDeadline)
+		n, _, err := conn.ReadFromUDP(buf)
+
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				break
+			}
+		}
+
+		if n >= protocol.HeaderSize {
+			var rHead protocol.Header
+			if rHead.Decode(buf[:protocol.HeaderSize]) == nil {
+				if protocol.CalculateChecksum(buf[:protocol.HeaderSize], buf[protocol.HeaderSize:n]) == rHead.Checksum && rHead.ConnectionID == connID {
+					if (rHead.Flags & (protocol.FlagFIN | protocol.FlagACK)) == (protocol.FlagFIN | protocol.FlagACK) {
+						fmt.Fprintf(os.Stderr, "Client mathematically targeted duplicate FIN-ACK recursively in TIME_WAIT. Re-sending explicitly isolated ACK...\n")
+						conn.Write(aBytes)
+					}
+				}
+			}
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "Client explicit TIME_WAIT timed successfully elegantly. Teardown COMPLETE!\n")
+	return nil
 }
 
 // clientHandshake handles the SYN-ACK handshake sequence with the server
@@ -296,6 +427,12 @@ func RunClient(cfg *config.Config, in io.Reader) error {
 
 	sender := NewSender(conn, connID, 5, cfg.Timeout) // Set bound configuration natively.
 	err = sender.Start(in)
+	if err != nil {
+		return err
+	}
+	sender.Stop()
+
+	err = clientTeardown(conn, connID, sender.NextSeqNum, cfg.Timeout)
 	if err != nil {
 		return err
 	}

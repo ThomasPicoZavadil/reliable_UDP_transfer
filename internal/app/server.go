@@ -137,6 +137,60 @@ func serverHandshake(conn *net.UDPConn, timeoutSec int) (*net.UDPAddr, uint32, [
 	}
 }
 
+func serverTeardown(conn *net.UDPConn, connID uint32, clientAddr *net.UDPAddr, finSeqNum uint32, timeoutSec int) error {
+	deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
+
+	finAckHeader := protocol.Header{
+		ConnectionID: connID,
+		SeqNum:       0,
+		AckNum:       finSeqNum + 1,
+		Flags:        protocol.FlagFIN | protocol.FlagACK,
+		Padding:      0,
+		Length:       0,
+		Checksum:     0,
+	}
+	faBytes := finAckHeader.Encode()
+	finAckHeader.Checksum = protocol.CalculateChecksum(faBytes, nil)
+	faBytes = finAckHeader.Encode()
+
+	buf := make([]byte, 1200)
+
+	for {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("server teardown limits timeout: failed receiving final structural explicit ACK bounding %d seconds cleanly", timeoutSec)
+		}
+
+		conn.WriteToUDP(faBytes, clientAddr)
+		fmt.Fprintf(os.Stderr, "Server iteratively isolated explicitly sending internal FIN-ACK - ConnID: %d\n", connID)
+
+		conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		n, addr, err := conn.ReadFromUDP(buf)
+
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				// Retry explicit standard FIN-ACK boundaries Native
+				continue
+			}
+			return fmt.Errorf("failed executing dynamic structurally isolated read frames mapping teardown: %w", err)
+		}
+
+		if addr.String() != clientAddr.String() || n < protocol.HeaderSize {
+			continue
+		}
+
+		var ackHeader protocol.Header
+		if ackHeader.Decode(buf[:protocol.HeaderSize]) == nil {
+			crc := protocol.CalculateChecksum(buf[:protocol.HeaderSize], buf[protocol.HeaderSize:n])
+			if crc == ackHeader.Checksum && ackHeader.ConnectionID == connID {
+				if (ackHeader.Flags & protocol.FlagACK) == protocol.FlagACK {
+					fmt.Fprintf(os.Stderr, "Server accurately validated explicit final cumulative ACK - ConnID: %d. Teardown COMPLETE!\n", connID)
+					return nil
+				}
+			}
+		}
+	}
+}
+
 // RunServer binds to a UDP socket, reads incoming datagrams sequentially, and writes to an output stream
 func RunServer(cfg *config.Config, out io.Writer) error {
 	addr := net.JoinHostPort(cfg.Address, strconv.Itoa(cfg.Port))
@@ -222,6 +276,16 @@ func RunServer(cfg *config.Config, out io.Writer) error {
 				continue // Drop foreign payloads natively
 			}
 
+			// Trap Explicit Structural FIN markers organically jumping to mapping states Native
+			if (h.Flags & protocol.FlagFIN) == protocol.FlagFIN {
+				fmt.Fprintf(os.Stderr, "Server intercepted isolated bounding mappings dynamically terminating - ConnID: %d\n", h.ConnectionID)
+				err := serverTeardown(conn, targetConnID, clientAddr, h.SeqNum, cfg.Timeout)
+				if err != nil {
+					return err
+				}
+				break // Gracefully map boundary teardowns
+			}
+
 			// Core sequential filtering
 			if h.SeqNum == expectedSeqNum {
 				fmt.Fprintf(os.Stderr, "Server received in-order packet - Seq: %d, Len: %d\n", h.SeqNum, h.Length)
@@ -253,9 +317,7 @@ func RunServer(cfg *config.Config, out io.Writer) error {
 				fmt.Fprintf(os.Stderr, "Server failed sending local ACK natively: %v\n", sendErr)
 			}
 		}
-
-		if readErr != nil {
-			return fmt.Errorf("error reading from UDP socket: %w", readErr)
-		}
 	}
+
+	return nil
 }
