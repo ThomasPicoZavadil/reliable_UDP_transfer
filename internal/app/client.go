@@ -18,6 +18,7 @@ type Packet struct {
 	SeqNum uint32
 	Data   []byte
 	Timer  *time.Timer
+	Acked  bool
 }
 
 type Sender struct {
@@ -179,18 +180,24 @@ func (s *Sender) receiveACKs() {
 
 		if (ackHeader.Flags & protocol.FlagACK) == protocol.FlagACK {
 			s.mu.Lock()
-			ackNum := ackHeader.AckNum
+			ackNum := ackHeader.AckNum // Now represents explicit Selective ACK SeqNum
 			
-			if ackNum > s.SendBase {
-                for seq, pkt := range s.Buffer {
-                    if seq < ackNum {
-                        pkt.Timer.Stop()
-                        delete(s.Buffer, seq)
-                    }
-                }
-                
-                s.SendBase = ackNum
-				s.windowCond.Broadcast() // Wake up the sender
+			if pkt, ok := s.Buffer[ackNum]; ok && !pkt.Acked {
+				pkt.Timer.Stop()
+				pkt.Acked = true
+			}
+
+			// Contiguous window sliding: find how far SendBase can advance
+			for {
+				if pkt, ok := s.Buffer[s.SendBase]; ok && pkt.Acked {
+					// Safely delete and jump the bytes
+					payloadSize := uint32(len(pkt.Data) - protocol.HeaderSize)
+					delete(s.Buffer, s.SendBase)
+					s.SendBase += payloadSize
+					s.windowCond.Broadcast() // Wake up the sender
+				} else {
+					break // Gap detected or mapped limit explicitly reached natively
+				}
 			}
 			s.mu.Unlock()
 		}
@@ -425,7 +432,7 @@ func RunClient(cfg *config.Config, in io.Reader) error {
 		return err
 	}
 
-	sender := NewSender(conn, connID, 5, cfg.Timeout) // Set bound configuration natively.
+	sender := NewSender(conn, connID, 500, cfg.Timeout) // Set bound configuration natively.
 	err = sender.Start(in)
 	if err != nil {
 		return err

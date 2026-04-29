@@ -212,6 +212,7 @@ func RunServer(cfg *config.Config, out io.Writer) error {
 	}
 
 	var expectedSeqNum uint32 = 0
+	recvBuffer := make(map[uint32][]byte)
 
 	if initPayload != nil && len(initPayload) > 0 {
 		_, writeErr := out.Write(initPayload)
@@ -224,7 +225,7 @@ func RunServer(cfg *config.Config, out io.Writer) error {
 		ackHeader := protocol.Header{
 			ConnectionID: targetConnID,
 			SeqNum:       0,
-			AckNum:       expectedSeqNum,
+			AckNum:       0,
 			Flags:        protocol.FlagACK,
 			Padding:      0,
 			Length:       0,
@@ -286,7 +287,7 @@ func RunServer(cfg *config.Config, out io.Writer) error {
 				break // Gracefully map boundary teardowns
 			}
 
-			// Core sequential filtering
+			// Selective Repeat mapping
 			if h.SeqNum == expectedSeqNum {
 				fmt.Fprintf(os.Stderr, "Server received in-order packet - Seq: %d, Len: %d\n", h.SeqNum, h.Length)
 				_, writeErr := out.Write(payload)
@@ -294,15 +295,37 @@ func RunServer(cfg *config.Config, out io.Writer) error {
 					return fmt.Errorf("failed to write output stream: %w", writeErr)
 				}
 				expectedSeqNum += uint32(h.Length)
-			} else {
-				fmt.Fprintf(os.Stderr, "Server received out-of-order packet - Seq: %d (expected %d). Dropping.\n", h.SeqNum, expectedSeqNum)
+
+				// Recursively drain cached out-of-order bounds structurally if possible
+				for {
+					if cachedPayload, exists := recvBuffer[expectedSeqNum]; exists {
+						fmt.Fprintf(os.Stderr, "Server dynamically drained cached buffer mapping - Seq: %d\n", expectedSeqNum)
+						_, writeErr := out.Write(cachedPayload)
+						if writeErr != nil {
+							return fmt.Errorf("failed to write cached stream natively: %w", writeErr)
+						}
+						delete(recvBuffer, expectedSeqNum)
+						expectedSeqNum += uint32(len(cachedPayload))
+					} else {
+						break
+					}
+				}
+
+			} else if h.SeqNum > expectedSeqNum {
+				fmt.Fprintf(os.Stderr, "Server dynamically cached out-of-order packet - Seq: %d\n", h.SeqNum)
+				// Cache isolated payload mapping specifically isolating structures organically
+				if _, exists := recvBuffer[h.SeqNum]; !exists {
+					bufferCopy := make([]byte, h.Length)
+					copy(bufferCopy, payload)
+					recvBuffer[h.SeqNum] = bufferCopy
+				}
 			}
 
-			// Cumulatively generate returning dynamic ACKs structurally mapped tracking latest guaranteed bounds
+			// Explicit Selective ACK targeting exact received block internally
 			ackHeader := protocol.Header{
 				ConnectionID: targetConnID,
 				SeqNum:       0,
-				AckNum:       expectedSeqNum,
+				AckNum:       h.SeqNum,
 				Flags:        protocol.FlagACK,
 				Padding:      0,
 				Length:       0,
@@ -314,7 +337,7 @@ func RunServer(cfg *config.Config, out io.Writer) error {
 
 			_, sendErr := conn.WriteToUDP(aBytes, clientAddr)
 			if sendErr != nil {
-				fmt.Fprintf(os.Stderr, "Server failed sending local ACK natively: %v\n", sendErr)
+				fmt.Fprintf(os.Stderr, "Server failed sending selective ACK natively: %v\n", sendErr)
 			}
 		}
 	}
