@@ -17,7 +17,6 @@ import (
 type Packet struct {
 	SeqNum uint32
 	Data   []byte
-	Timer  *time.Timer
 	Acked  bool
 }
 
@@ -34,26 +33,44 @@ type Sender struct {
 	conn   *net.UDPConn
 	connID uint32
 
-	timeout time.Duration
-	done    chan struct{}
+	retransmitInterval time.Duration
+	done               chan struct{}
+	baseTimer          *time.Timer
 }
 
-func NewSender(conn *net.UDPConn, connID uint32, windowSizePackets uint32, timeoutSec int) *Sender {
+func NewSender(conn *net.UDPConn, connID uint32, windowSizePackets uint32) *Sender {
 	s := &Sender{
-		WindowSize: windowSizePackets,
-		SendBase:   0,
-		NextSeqNum: 0,
-		Buffer:     make(map[uint32]*Packet),
-		conn:       conn,
-		connID:     connID,
-		timeout:    time.Duration(timeoutSec) * time.Second,
-		done:       make(chan struct{}),
+		WindowSize:         windowSizePackets,
+		SendBase:           0,
+		NextSeqNum:         0,
+		Buffer:             make(map[uint32]*Packet),
+		conn:               conn,
+		connID:             connID,
+		retransmitInterval: 100 * time.Millisecond,
+		done:               make(chan struct{}),
 	}
 	s.windowCond = sync.NewCond(&s.mu)
+
+	s.baseTimer = time.AfterFunc(s.retransmitInterval, func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		// On timeout, retransmit ALL unacked packets in the window
+		for _, pkt := range s.Buffer {
+			if !pkt.Acked {
+				s.conn.Write(pkt.Data)
+			}
+		}
+		if len(s.Buffer) > 0 {
+			s.baseTimer.Reset(s.retransmitInterval)
+		}
+	})
+	s.baseTimer.Stop()
+
 	return s
 }
 
 func (s *Sender) Stop() {
+	s.baseTimer.Stop()
 	close(s.done)
 }
 
@@ -71,7 +88,7 @@ func (s *Sender) Start(in io.Reader) error {
 
 			s.mu.Lock()
 			// Block if the window is full
-			for (s.NextSeqNum-s.SendBase)/maxPayload >= s.WindowSize {
+			for uint32(len(s.Buffer)) >= s.WindowSize {
 				s.windowCond.Wait()
 			}
 
@@ -100,23 +117,13 @@ func (s *Sender) Start(in io.Reader) error {
 				Data:   combined,
 			}
 			
-			// Setup timer
-			p.Timer = time.AfterFunc(s.timeout, func() {
-				s.mu.Lock()
-				// Verify if packet is still in buffer before resending
-				if _, ok := s.Buffer[seqNum]; ok {
-                    fmt.Fprintf(os.Stderr, "Client timeout retransmitting - Seq: %d\n", seqNum)
-					s.conn.Write(p.Data)
-					p.Timer.Reset(s.timeout) // Restart timer
-				}
-				s.mu.Unlock()
-			})
-
 			s.Buffer[seqNum] = p
+
+			if len(s.Buffer) == 1 {
+				s.baseTimer.Reset(s.retransmitInterval)
+			}
 			s.mu.Unlock()
 
-			// Initial send
-            fmt.Fprintf(os.Stderr, "Client sent packet - Seq: %d, Len: %d\n", h.SeqNum, h.Length)
 			_, writeErr := s.conn.Write(p.Data)
 			if writeErr != nil {
 				return fmt.Errorf("failed to send data: %w", writeErr)
@@ -183,21 +190,30 @@ func (s *Sender) receiveACKs() {
 			ackNum := ackHeader.AckNum // Now represents explicit Selective ACK SeqNum
 			
 			if pkt, ok := s.Buffer[ackNum]; ok && !pkt.Acked {
-				pkt.Timer.Stop()
 				pkt.Acked = true
 			}
 
 			// Contiguous window sliding: find how far SendBase can advance
+			advanced := false
 			for {
 				if pkt, ok := s.Buffer[s.SendBase]; ok && pkt.Acked {
 					// Safely delete and jump the bytes
 					payloadSize := uint32(len(pkt.Data) - protocol.HeaderSize)
 					delete(s.Buffer, s.SendBase)
 					s.SendBase += payloadSize
-					s.windowCond.Broadcast() // Wake up the sender
+					advanced = true
 				} else {
 					break // Gap detected or mapped limit explicitly reached natively
 				}
+			}
+
+			if advanced {
+				if len(s.Buffer) == 0 {
+					s.baseTimer.Stop()
+				} else {
+					s.baseTimer.Reset(s.retransmitInterval)
+				}
+				s.windowCond.Broadcast() // Wake up the sender explicitly
 			}
 			s.mu.Unlock()
 		}
@@ -432,7 +448,7 @@ func RunClient(cfg *config.Config, in io.Reader) error {
 		return err
 	}
 
-	sender := NewSender(conn, connID, 500, cfg.Timeout) // Set bound configuration natively.
+	sender := NewSender(conn, connID, 32)
 	err = sender.Start(in)
 	if err != nil {
 		return err
