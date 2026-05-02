@@ -210,15 +210,24 @@ func RunServer(cfg *config.Config, out io.Writer) error {
 
 	var expectedSeqNum uint32 = 0
 	recvBuffer := make(map[uint32][]byte)
+	lastProgress := time.Now()
+	progressTimeout := time.Duration(cfg.Timeout) * time.Second
 
 	buf := make([]byte, 1200)
 
-	// Keep listening block indefinitely (or until interrupted/fatal error) natively filtering using targets
 	for {
-		conn.SetReadDeadline(time.Time{})
+		// Check progress timeout
+		if time.Since(lastProgress) > progressTimeout {
+			return fmt.Errorf("no protocol progress for %d seconds", cfg.Timeout)
+		}
+
+		conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
 		n, addr, readErr := conn.ReadFromUDP(buf)
 		if readErr != nil {
-			return fmt.Errorf("error reading from UDP socket: %w", readErr)
+			if netErr, ok := readErr.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			continue
 		}
 
 		if addr.String() != clientAddr.String() {
@@ -245,7 +254,7 @@ func RunServer(cfg *config.Config, out io.Writer) error {
 			}
 
 			if h.ConnectionID != targetConnID {
-				continue // Drop foreign payloads natively
+				continue
 			}
 
 			if (h.Flags & protocol.FlagFIN) == protocol.FlagFIN {
@@ -254,7 +263,7 @@ func RunServer(cfg *config.Config, out io.Writer) error {
 				if err != nil {
 					return err
 				}
-				break // Gracefully map boundary teardowns
+				break
 			}
 
 			if h.SeqNum == expectedSeqNum {
@@ -263,6 +272,7 @@ func RunServer(cfg *config.Config, out io.Writer) error {
 					return fmt.Errorf("failed to write output stream: %w", writeErr)
 				}
 				expectedSeqNum += uint32(h.Length)
+				lastProgress = time.Now() // genuine progress: new in-order data
 
 				for {
 					if cachedPayload, exists := recvBuffer[expectedSeqNum]; exists {
@@ -282,6 +292,7 @@ func RunServer(cfg *config.Config, out io.Writer) error {
 					bufferCopy := make([]byte, len(payload))
 					copy(bufferCopy, payload)
 					recvBuffer[h.SeqNum] = bufferCopy
+					lastProgress = time.Now() // genuine progress: new cached data
 				}
 			}
 
