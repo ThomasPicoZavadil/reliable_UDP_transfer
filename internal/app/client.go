@@ -36,9 +36,13 @@ type Sender struct {
 	retransmitInterval time.Duration
 	done               chan struct{}
 	baseTimer          *time.Timer
+
+	lastProgress    time.Time
+	progressTimeout time.Duration
+	timedOut        bool
 }
 
-func NewSender(conn *net.UDPConn, connID uint32, windowSizePackets uint32) *Sender {
+func NewSender(conn *net.UDPConn, connID uint32, windowSizePackets uint32, progressTimeout time.Duration) *Sender {
 	s := &Sender{
 		WindowSize:         windowSizePackets,
 		SendBase:           0,
@@ -48,6 +52,8 @@ func NewSender(conn *net.UDPConn, connID uint32, windowSizePackets uint32) *Send
 		connID:             connID,
 		retransmitInterval: 100 * time.Millisecond,
 		done:               make(chan struct{}),
+		lastProgress:       time.Now(),
+		progressTimeout:    progressTimeout,
 	}
 	s.windowCond = sync.NewCond(&s.mu)
 
@@ -87,9 +93,13 @@ func (s *Sender) Start(in io.Reader) error {
 			copy(payload, buf[:n])
 
 			s.mu.Lock()
-			// Block if the window is full
-			for uint32(len(s.Buffer)) >= s.WindowSize {
+			// Block if the window is full, but bail on timeout
+			for uint32(len(s.Buffer)) >= s.WindowSize && !s.timedOut {
 				s.windowCond.Wait()
+			}
+			if s.timedOut {
+				s.mu.Unlock()
+				return fmt.Errorf("no protocol progress for %d seconds", int(s.progressTimeout.Seconds()))
 			}
 
 			// Capture sequence number before creating header
@@ -140,8 +150,12 @@ func (s *Sender) Start(in io.Reader) error {
 
 	// Wait for all outstanding packets to be ACKed
 	s.mu.Lock()
-	for len(s.Buffer) > 0 {
+	for len(s.Buffer) > 0 && !s.timedOut {
 		s.windowCond.Wait()
+	}
+	if s.timedOut {
+		s.mu.Unlock()
+		return fmt.Errorf("no protocol progress for %d seconds", int(s.progressTimeout.Seconds()))
 	}
 	s.mu.Unlock()
 
@@ -157,13 +171,23 @@ func (s *Sender) receiveACKs() {
 		default:
 		}
 
+		// Check progress timeout
+		s.mu.Lock()
+		if time.Since(s.lastProgress) > s.progressTimeout {
+			s.timedOut = true
+			s.windowCond.Broadcast()
+			s.mu.Unlock()
+			return
+		}
+		s.mu.Unlock()
+
 		s.conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
 		n, _, err := s.conn.ReadFromUDP(buf)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
 			}
-			return
+			continue
 		}
 
 		if n < protocol.HeaderSize {
@@ -191,6 +215,7 @@ func (s *Sender) receiveACKs() {
 			
 			if pkt, ok := s.Buffer[ackNum]; ok && !pkt.Acked {
 				pkt.Acked = true
+				s.lastProgress = time.Now() // genuine protocol progress
 			}
 
 			// Contiguous window sliding: find how far SendBase can advance
@@ -448,7 +473,7 @@ func RunClient(cfg *config.Config, in io.Reader) error {
 		return err
 	}
 
-	sender := NewSender(conn, connID, 32)
+	sender := NewSender(conn, connID, 32, time.Duration(cfg.Timeout)*time.Second)
 	err = sender.Start(in)
 	if err != nil {
 		return err
