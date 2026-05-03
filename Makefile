@@ -10,3 +10,6 @@ test:
 
 clean:
 	rm -f ipk-rdt
+
+NixDevShellName:
+	@echo go
