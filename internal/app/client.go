@@ -39,7 +39,6 @@ type Sender struct {
 
 	lastProgress    time.Time
 	progressTimeout time.Duration
-	timedOut        bool
 }
 
 func NewSender(conn *net.UDPConn, connID uint32, windowSizePackets uint32, progressTimeout time.Duration) *Sender {
@@ -93,13 +92,9 @@ func (s *Sender) Start(in io.Reader) error {
 			copy(payload, buf[:n])
 
 			s.mu.Lock()
-			// Block if the window is full, but bail on timeout
-			for uint32(len(s.Buffer)) >= s.WindowSize && !s.timedOut {
+			// Block if the window is full
+			for uint32(len(s.Buffer)) >= s.WindowSize {
 				s.windowCond.Wait()
-			}
-			if s.timedOut {
-				s.mu.Unlock()
-				return fmt.Errorf("no protocol progress for %d seconds", int(s.progressTimeout.Seconds()))
 			}
 
 			// Capture sequence number before creating header
@@ -150,12 +145,8 @@ func (s *Sender) Start(in io.Reader) error {
 
 	// Wait for all outstanding packets to be ACKed
 	s.mu.Lock()
-	for len(s.Buffer) > 0 && !s.timedOut {
+	for len(s.Buffer) > 0 {
 		s.windowCond.Wait()
-	}
-	if s.timedOut {
-		s.mu.Unlock()
-		return fmt.Errorf("no protocol progress for %d seconds", int(s.progressTimeout.Seconds()))
 	}
 	s.mu.Unlock()
 
@@ -174,10 +165,9 @@ func (s *Sender) receiveACKs() {
 		// Check progress timeout
 		s.mu.Lock()
 		if time.Since(s.lastProgress) > s.progressTimeout {
-			s.timedOut = true
-			s.windowCond.Broadcast()
 			s.mu.Unlock()
-			return
+			fmt.Fprintf(os.Stderr, "Client error: no protocol progress for %d seconds\n", int(s.progressTimeout.Seconds()))
+			os.Exit(1)
 		}
 		s.mu.Unlock()
 
